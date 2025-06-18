@@ -15,7 +15,8 @@
  *
  * V1.0 - initial version
  * V1.1 - add support for kernel 3.11.x
- * V1.2 - add support for HALF_DUPLEX spi controller
+ * V1.2 - re-implement spi TX/RX data transfer logic for bulk transfers
+ * V1.3	- cancel interrupt delay to prevent duplicate reception
  */
 
 #define DEBUG
@@ -49,25 +50,27 @@
 #define DRIVER_AUTHOR "WCH"
 #define DRIVER_DESC \
 	"CAN bus driver for CH9431 CAN Controller with SPI Interface"
-#define VERSION_DESC "V1.2 On 2025.05"
+#define VERSION_DESC "V1.3 On 2025.06"
 
 #define USE_IRQ_FROM_DTS
-#define GPIO_NUMBER 512 + 12
+#define GPIO_NUMBER 0
 //#undef USE_IRQ_FROM_DTS
 
-#define REG_LABEL(REG)    \
-	{                 \
-#REG, REG \
-	}
+#define REG_LABEL(REG) { #REG, REG }
 
 #define CH9431_CLK_FREQ 20000000
 #define TX_ECHO_SKB_MAX 1
 
+#define CH9431_TXBD_CMD_LEN 1
+#define CAN_FRAME_HEADER_LEN 5
+#define CAN_FRAME_TX_CMD_LEN 6
 #define CAN_FRAME_MAX_DATA_LEN 8
-#define SPI_TRANSFER_BUF_LEN (6 + CAN_FRAME_MAX_DATA_LEN)
+#define SPI_TRANSFER_BUF_LEN \
+	(CAN_FRAME_TX_CMD_LEN + CAN_FRAME_MAX_DATA_LEN)
 
 /* SPI Delay */
-#define WAIT_DATA_US (5)
+#define WAIT_DATA_US (1)
+#define CLR_INTR_US (5)
 #define OST_DELAY_MS (5)
 #define RST_DELAY_MS (16)
 
@@ -81,9 +84,11 @@
 #define CMD_CAN_RTS 0x80
 #define CMD_CAN_LOAD_TX 0X40
 #define CMD_CAN_RD_RX_BUFF 0x90
-#define INSTRUCTION_READ_RXB(n) (((n) == 0) ? 0x90 : 0x94)
-#define INSTRUCTION_LOAD_TXB(n) (0x40 + 2 * (n))
-#define INSTRUCTION_RTS(n) (0x80 | ((n)&0x07))
+#define INSTRUCTION_READ_RXBS(n) (((n) == 0) ? 0x90 : 0x94)
+#define INSTRUCTION_READ_RXBD(n) (((n) == 0) ? 0x92 : 0x96)
+#define INSTRUCTION_LOAD_TXBS(n) (0x40 + 2 * (n))
+#define INSTRUCTION_LOAD_TXBD(n) (0x41 + 2 * (n))
+#define INSTRUCTION_RTS(n) (0x80 | ((n) & 0x07))
 
 /* CH9431 configuration registers */
 #define CH9431_CTRL 0x0F
@@ -159,7 +164,7 @@
 #define CH9431_EFLAG_EWARN (1 << 0)
 
 /*  CH9431 receive filters */
-#define RXFAID(n) (((n)*4) + 0x00)
+#define RXFAID(n) (((n) * 4) + 0x00)
 
 #define RXF0SIDL 0x00
 #define RXF0SIDH 0x01
@@ -198,7 +203,7 @@
 #define RXF5EIDH 0x1B
 
 /* Receive masks */
-#define RXMID(n) (((n)*4) + 0x20)
+#define RXMID(n) (((n) * 4) + 0x20)
 #define RXM0SIDL 0x20
 #define RXM0SIDH 0x21
 #define RXM0EIDL 0x22
@@ -210,8 +215,9 @@
 #define RXM1EIDH 0x27
 
 /* CH9431 TX buffer 0 */
-#define TXBCTRL(n) (((n)*0x10) + 0x30 + TXBCTRL_OFF)
+#define TXBCTRL(n) (((n) * 0x10) + 0x30 + TXBCTRL_OFF)
 #define TXB0CTRL 0x30
+#define TXBS_LOAD_CMD 0
 #define TXBCTRL_OFF 0
 #define TXBSIDL_OFF 1
 #define TXBSIDH_OFF 2
@@ -221,7 +227,8 @@
 #define TXBDLC_OFF 5
 #define RXBDLC_RTR 0x40
 #define RXBDLC_LEN_MASK 0x0F
-#define TXBDAT_OFF 6
+#define TXBD_LOAD_CMD 6
+#define TXBDAT_OFF 7
 
 #define TXB0SIDL 0x31
 #define TXB0SIDH 0x32
@@ -229,7 +236,7 @@
 #define TXB0EIDH 0x34
 
 #define TXB0DLC 0x35
-#define TXBDAT(n) (((n)*0x10) + 0x30 + TXBDAT_OFF)
+#define TXBDAT(n) (((n) * 0x10) + 0x30 + TXBD_LOAD_CMD)
 #define TXB0D0 0x36
 #define TXB0D1 0x37
 #define TXB0D2 0x38
@@ -276,20 +283,19 @@
 #define TXB2D7 0x5D
 
 /* CH9431 RX buffer 0 */
-#define RXBCTRL(n)  (((n) * 0x10) + 0x60 + RXBCTRL_OFF)
+#define RXBCTRL(n) (((n) * 0x10) + 0x60 + RXBCTRL_OFF)
 #define RXB0CTRL 0x60
 #define RXBCTRL_BUKT (1 << 2)
-#define RXBCTRL_OFF 0
-#define RXBSIDL_OFF 1
-#define RXBSIDH_OFF 2
+#define RXBSIDL_OFF 0
+#define RXBSIDH_OFF 1
 #define RXBSIDH_EXIDE 0x10
-#define RXBEIDL_OFF 3
-#define RXBEIDH_OFF 4
-#define RXBDLC_OFF 5
+#define RXBEIDL_OFF 2
+#define RXBEIDH_OFF 3
+#define RXBDLC_OFF 4
 #define RXBDLC_RTR 0x40
 #define RXBDLC_LEN_MASK 0x0F
-#define RXBDAT_OFF 6
-#define RXBDAT(n) (((n)*0x10) + 0x60 + RXBDAT_OFF)
+#define RXBDAT_OFF 5
+#define RXBDAT(n) (((n) * 0x10) + 0x60 + RXBDAT_OFF)
 #define RXB0SIDL 0x61
 #define RXB0SIDH 0x62
 #define RXB0EIDL 0x63
@@ -328,46 +334,51 @@ static const struct can_bittiming_const ch9431_bittiming_const = {
 };
 
 struct reg_label {
-	char	    *name;
+	char *name;
 	unsigned int reg;
 };
 
 static struct reg_label reg_labels[] = {
-	REG_LABEL(CH9431_CTRL), REG_LABEL(CH9431_STAT),	 REG_LABEL(BTIMER1),
-	REG_LABEL(BTIMER2),	REG_LABEL(BTIMER3),	 REG_LABEL(CH9431_INTE),
-	REG_LABEL(CH9431_INTF), REG_LABEL(CH9431_EFLAG), REG_LABEL(TXB0CTRL),
-	REG_LABEL(TXB0DLC),	REG_LABEL(TXB0D0),	 REG_LABEL(TXB1CTRL),
-	REG_LABEL(TXB1DLC),	REG_LABEL(TXB1D0),	 REG_LABEL(TXB2CTRL),
-	REG_LABEL(TXB2DLC),	REG_LABEL(TXB2D0),	 REG_LABEL(RXB0CTRL),
-	REG_LABEL(RXB1CTRL),	REG_LABEL(RXF0SIDL),	 REG_LABEL(RXF0SIDH),
-	REG_LABEL(RXF0EIDL),	REG_LABEL(RXF0EIDH),	 REG_LABEL(RXF2SIDL),
-	REG_LABEL(RXF2SIDH),	REG_LABEL(RXF2EIDL),	 REG_LABEL(RXF2EIDH),
-	REG_LABEL(RXF3SIDL),	REG_LABEL(RXF3SIDH),	 REG_LABEL(RXF3EIDL),
+	REG_LABEL(CH9431_CTRL), REG_LABEL(CH9431_STAT),
+	REG_LABEL(BTIMER1),	REG_LABEL(BTIMER2),
+	REG_LABEL(BTIMER3),	REG_LABEL(CH9431_INTE),
+	REG_LABEL(CH9431_INTF), REG_LABEL(CH9431_EFLAG),
+	REG_LABEL(TXB0CTRL),	REG_LABEL(TXB0DLC),
+	REG_LABEL(TXB0D0),	REG_LABEL(TXB1CTRL),
+	REG_LABEL(TXB1DLC),	REG_LABEL(TXB1D0),
+	REG_LABEL(TXB2CTRL),	REG_LABEL(TXB2DLC),
+	REG_LABEL(TXB2D0),	REG_LABEL(RXB0CTRL),
+	REG_LABEL(RXB1CTRL),	REG_LABEL(RXF0SIDL),
+	REG_LABEL(RXF0SIDH),	REG_LABEL(RXF0EIDL),
+	REG_LABEL(RXF0EIDH),	REG_LABEL(RXF2SIDL),
+	REG_LABEL(RXF2SIDH),	REG_LABEL(RXF2EIDL),
+	REG_LABEL(RXF2EIDH),	REG_LABEL(RXF3SIDL),
+	REG_LABEL(RXF3SIDH),	REG_LABEL(RXF3EIDL),
 	REG_LABEL(RXF3EIDH),
 };
 
 struct ch9431_priv {
-	struct can_priv	   can;
+	struct can_priv can;
 	struct net_device *ndev;
 	struct spi_device *spi;
-	struct mutex	   reg_lock;
-	struct mutex	   ops_lock;
+	struct mutex reg_lock;
+	struct mutex ops_lock;
 
 	u8 *spi_tx_buf;
 	u8 *spi_rx_buf;
 
-	struct sk_buff		*tx_skb;
+	struct sk_buff *tx_skb;
 	struct workqueue_struct *wq;
-	struct work_struct	 tx_work;
-	struct work_struct	 restart_work;
-	int			 force_quit;
-	int			 after_suspend;
+	struct work_struct tx_work;
+	struct work_struct restart_work;
+	int force_quit;
+	int after_suspend;
 #define AFTER_SUSPEND_UP 1
 #define AFTER_SUSPEND_DOWN 2
 #define AFTER_SUSPEND_POWER 4
 #define AFTER_SUSPEND_RESTART 8
-	int		  restart_tx;
-	bool		  tx_busy;
+	int restart_tx;
+	bool tx_busy;
 	struct regulator *power;
 	struct regulator *transceiver;
 };
@@ -390,32 +401,95 @@ static void ch9431_clean(struct net_device *ndev)
 	ch9431->tx_busy = false;
 }
 
-static int ch9431_spi_write(struct ch9431_priv *ch9431, int len)
+static int ch9431_spi_write(struct ch9431_priv *ch9431, u8 *buf, int len)
 {
 	int ret;
 
 	mutex_lock(&ch9431->reg_lock);
 
-	ret = spi_write(ch9431->spi, ch9431->spi_tx_buf, len);
+	ret = spi_write(ch9431->spi, buf, len);
 	if (ret)
-		dev_err(&ch9431->spi->dev, "%s, spi write failed: ret = %d\n",
-			__func__, ret);
+		dev_err(&ch9431->spi->dev,
+			"%s, spi write failed: ret = %d\n", __func__, ret);
 
 	mutex_unlock(&ch9431->reg_lock);
 
-	mdelay(1);
+	return ret;
+}
+
+static int ch9431_spi_trans(struct ch9431_priv *ch9431, u8 *buf, u8 reg,
+			    int len)
+{
+	struct spi_transfer xfer[2] = {};
+	struct spi_message m;
+	u8 cmd = reg;
+	int ret;
+
+	xfer[0].tx_buf = &cmd;
+	xfer[0].len = 1;
+	xfer[0].cs_change = 0;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 19))
+	xfer[0].delay.value = WAIT_DATA_US;
+#else
+	xfer[0].delay_usecs = WAIT_DATA_US;
+#endif
+
+	xfer[1].rx_buf = buf;
+	xfer[1].len = len;
+
+	mutex_lock(&ch9431->reg_lock);
+
+	spi_message_init(&m);
+	spi_message_add_tail(&xfer[0], &m);
+	spi_message_add_tail(&xfer[1], &m);
+
+	ret = spi_sync(ch9431->spi, &m);
+	if (ret)
+		dev_err(&ch9431->spi->dev,
+			"%s, spi transfer failed: ret = %d\n", __func__,
+			ret);
+
+	mutex_unlock(&ch9431->reg_lock);
 
 	return ret;
 }
 
 static u8 ch9431_read_reg(struct ch9431_priv *ch9431, u8 reg)
 {
+	struct spi_transfer xfer[2] = {};
+	struct spi_message m;
+	u8 cmd[2] = {};
 	u8 val = 0;
+	int ret;
 
-	ch9431->spi_tx_buf[0] = CMD_CAN_READ;
-	ch9431->spi_tx_buf[1] = reg;
+	cmd[0] = CMD_CAN_READ;
+	cmd[1] = reg;
 
-	spi_write_then_read(ch9431->spi, ch9431->spi_tx_buf, 2, &val, 1);
+	xfer[0].tx_buf = cmd;
+	xfer[0].len = 2;
+	xfer[0].cs_change = 0;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 19))
+	xfer[0].delay.value = WAIT_DATA_US;
+#else
+	xfer[0].delay_usecs = WAIT_DATA_US;
+#endif
+
+	xfer[1].rx_buf = &val;
+	xfer[1].len = 1;
+
+	mutex_lock(&ch9431->reg_lock);
+
+	spi_message_init(&m);
+	spi_message_add_tail(&xfer[0], &m);
+	spi_message_add_tail(&xfer[1], &m);
+
+	ret = spi_sync(ch9431->spi, &m);
+	if (ret)
+		dev_err(&ch9431->spi->dev,
+			"%s, spi transfer failed: ret = %d\n", __func__,
+			ret);
+
+	mutex_unlock(&ch9431->reg_lock);
 
 	return val;
 }
@@ -427,15 +501,11 @@ static void ch9431_read_2regs(struct ch9431_priv *ch9431, u8 reg, u8 *v1,
 	*v2 = ch9431_read_reg(ch9431, reg + 1);
 }
 
-static void ch9431_read_mem(struct ch9431_priv *ch9431, u8 reg, u8 *buff,
-			    int len)
+static void ch9431_read_mem(struct ch9431_priv *ch9431, int rx_buf_idx,
+			    u8 *buff, int len)
 {
-	int i;
-
-	for (i = 0; i < len; i++)
-		buff[i + RXBDAT_OFF] = ch9431_read_reg(ch9431, reg + i);
-
-	return;
+	ch9431_spi_trans(ch9431, buff, INSTRUCTION_READ_RXBD(rx_buf_idx),
+			 len);
 }
 
 static int ch9431_write_reg(struct ch9431_priv *ch9431, u8 reg, u8 val)
@@ -444,51 +514,69 @@ static int ch9431_write_reg(struct ch9431_priv *ch9431, u8 reg, u8 val)
 	ch9431->spi_tx_buf[1] = reg;
 	ch9431->spi_tx_buf[2] = val;
 
-	return ch9431_spi_write(ch9431, 3);
+	return ch9431_spi_write(ch9431, ch9431->spi_tx_buf, 3);
 }
 
-static int ch9431_write_2regs(struct ch9431_priv *ch9431, u8 reg, u8 v1, u8 v2)
+static int ch9431_write_2regs(struct ch9431_priv *ch9431, u8 reg, u8 v1,
+			      u8 v2)
 {
 	int ret;
 
 	ret = ch9431_write_reg(ch9431, reg, v1);
 	if (ret)
-		dev_err(&ch9431->spi->dev, "%s, ch9431 write reg: [0x%02x] failed.\n",
+		dev_err(&ch9431->spi->dev,
+			"%s, ch9431 write reg: [0x%02x] failed.\n",
 			__func__, reg);
 
 	ret = ch9431_write_reg(ch9431, reg + 1, v2);
 	if (ret)
-		dev_err(&ch9431->spi->dev, "%s, ch9431 write reg: [0x%02x] failed.\n",
+		dev_err(&ch9431->spi->dev,
+			"%s, ch9431 write reg: [0x%02x] failed.\n",
 			__func__, reg + 1);
 
 	return ret;
 }
 
-static int ch9431_write_mem(struct ch9431_priv *ch9431, u8 reg, int len)
+static void ch9431_write_mem(struct ch9431_priv *ch9431, int tx_buf_idx,
+			     u8 *buff, int len)
 {
-	int ret = 0, i;
-
-	for (i = 0; i < len; i++) {
-		ret = ch9431_write_reg(ch9431, reg + i,
-				       ch9431->spi_tx_buf[TXBDAT_OFF + i]);
-		if (ret)
-			dev_err(&ch9431->spi->dev,
-				"%s, ch9431 write reg: [0x%02x] failed.\n", __func__,
-				reg + i);
-	}
-
-	return ret;
+	ch9431_spi_write(ch9431, buff, len);
 }
 
-static void ch9431_write_bits(struct ch9431_priv *ch9431, u8 reg, u8 mask,
+static int ch9431_write_bits(struct ch9431_priv *ch9431, u8 reg, u8 mask,
 			      u8 val)
 {
+	struct spi_transfer xfer = {};
+	struct spi_message m;
+	int ret;
+
 	ch9431->spi_tx_buf[0] = CMD_CAN_BIT_MODIFY;
 	ch9431->spi_tx_buf[1] = reg;
 	ch9431->spi_tx_buf[2] = mask;
 	ch9431->spi_tx_buf[3] = val;
 
-	ch9431_spi_write(ch9431, 4);
+	xfer.tx_buf = ch9431->spi_tx_buf;
+	xfer.len = 4;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 19))
+	xfer.delay.value = CLR_INTR_US;
+#else
+	xfer.delay_usecs = CLR_INTR_US;
+#endif
+
+	mutex_lock(&ch9431->reg_lock);
+
+	spi_message_init(&m);
+	spi_message_add_tail(&xfer, &m);
+
+	ret = spi_sync(ch9431->spi, &m);
+	if (ret)
+		dev_err(&ch9431->spi->dev,
+			"%s, spi write bits failed: ret = %d\n", __func__,
+			ret);
+
+	mutex_unlock(&ch9431->reg_lock);
+
+	return ret;
 }
 
 static u8 ch9431_read_stat(struct ch9431_priv *ch9431)
@@ -500,12 +588,12 @@ static u8 ch9431_read_stat(struct ch9431_priv *ch9431)
 	return val & CH9431_CTRL_REQOP_MASK;
 }
 
-static int ch9431_read_stat_poll_timeout(struct ch9431_priv *ch9431, u8 mask,
-					 unsigned int delay_us,
+static int ch9431_read_stat_poll_timeout(struct ch9431_priv *ch9431,
+					 u8 mask, unsigned int delay_us,
 					 unsigned int timeout_us)
 {
 	unsigned int elapsed_us = 0;
-	u8	     value;
+	u8 value;
 
 	while (elapsed_us < timeout_us) {
 		value = ch9431_read_stat(ch9431);
@@ -530,51 +618,51 @@ static int ch9431_get_version(struct ch9431_priv *ch9431)
 	ch9431->spi_tx_buf[0] = 0x00;
 	ch9431->spi_tx_buf[1] = 0x76;
 
-	ret = spi_write_then_read(ch9431->spi, ch9431->spi_tx_buf, 2, val, 8);
+	ret = spi_write_then_read(ch9431->spi, ch9431->spi_tx_buf, 2, val,
+				  8);
 
-	printk(KERN_INFO "ch9431 device probe, driver version: %s, fw version: %s\n", VERSION_DESC, val);
+	printk(KERN_INFO
+	       "ch9431 device probe, driver version: %s, fw version: %s\n",
+	       VERSION_DESC, val);
 
 	kfree(val);
 
-    return ret;
+	return ret;
+}
+
+static void ch9431_clear_intr(struct ch9431_priv *ch9431, u8 mask)
+{
+	ch9431_write_bits(ch9431, CH9431_INTF, mask, 0x00);
 }
 
 static const struct ethtool_ops ch9431_ethtool_ops = {
 	.get_ts_info = ethtool_op_get_ts_info,
 };
 
-static int ch9431_hw_tx_frame(struct ch9431_priv *ch9431, u8 *buf, int len,
-			      int tx_buf_idx)
+static void ch9431_hw_tx_frame(struct ch9431_priv *ch9431, u8 *buf,
+			       int tx_buf_idx)
 {
-	int ret = 0;
-
-	memcpy(ch9431->spi_tx_buf, buf, TXBDAT_OFF + len);
-	ret = ch9431_spi_write(ch9431, TXBDAT_OFF);
-
-	udelay(WAIT_DATA_US);
-	ret = ch9431_write_mem(ch9431, TXBDAT(tx_buf_idx), len);
-	if (ret)
-		dev_err(&ch9431->spi->dev, "%s, ch9431 write mem failed!\n",
-			__func__);
-
-	return ret;
+	ch9431_spi_write(ch9431, buf, CAN_FRAME_TX_CMD_LEN);
 }
 
-static void ch9431_hw_tx(struct ch9431_priv *ch9431, struct can_frame *frame,
-			 int tx_buf_idx)
+static void ch9431_hw_tx(struct ch9431_priv *ch9431,
+			 struct can_frame *frame, int tx_buf_idx)
 {
 	u32 sid, eid, exide, rtr;
-	u8  buf[SPI_TRANSFER_BUF_LEN];
+	u8 buf[SPI_TRANSFER_BUF_LEN + CH9431_TXBD_CMD_LEN];
 
-	exide = (frame->can_id & CAN_EFF_FLAG) ? 1 : 0; /* Extended ID Enable */
+	exide = (frame->can_id & CAN_EFF_FLAG) ?
+			1 :
+			0; /* Extended ID Enable */
 	if (exide)
 		sid = (frame->can_id & CAN_EFF_MASK) >> 18;
 	else
-		sid = frame->can_id & CAN_SFF_MASK;   /* Standard ID */
-	eid = frame->can_id & CAN_EFF_MASK;	      /* Extended ID */
-	rtr = (frame->can_id & CAN_RTR_FLAG) ? 1 : 0; /* Remote transmission */
+		sid = frame->can_id & CAN_SFF_MASK; /* Standard ID */
+	eid = frame->can_id & CAN_EFF_MASK; /* Extended ID */
+	rtr = (frame->can_id & CAN_RTR_FLAG) ? 1 :
+					       0; /* Remote transmission */
 
-	buf[TXBCTRL_OFF] = INSTRUCTION_LOAD_TXB(tx_buf_idx);
+	buf[TXBS_LOAD_CMD] = INSTRUCTION_LOAD_TXBS(tx_buf_idx);
 	buf[TXBSIDL_OFF] = (sid & 0xFF);
 	buf[TXBSIDH_OFF] = ((eid & 0x03) << 6) | (exide << 4) |
 			   ((sid >> 8) & 0x07);
@@ -582,34 +670,39 @@ static void ch9431_hw_tx(struct ch9431_priv *ch9431, struct can_frame *frame,
 	buf[TXBEIDH_OFF] = (eid >> 10) & 0xFF;
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0))
 	buf[TXBDLC_OFF] = (rtr << 6) | (frame->len & 0x0F);
+	buf[TXBD_LOAD_CMD] = INSTRUCTION_LOAD_TXBD(tx_buf_idx);
+
 	memcpy(buf + TXBDAT_OFF, frame->data, frame->len);
-	ch9431_hw_tx_frame(ch9431, buf, frame->len, tx_buf_idx);
+	ch9431_hw_tx_frame(ch9431, buf, tx_buf_idx);
+	ch9431_write_mem(ch9431, tx_buf_idx, buf + TXBD_LOAD_CMD,
+			 frame->len + CH9431_TXBD_CMD_LEN);
 #else
 	buf[TXBDLC_OFF] = (rtr << 6) | (frame->can_dlc & 0x0F);
-	memcpy(buf + TXBDAT_OFF, frame->data, frame->can_dlc);
-	ch9431_hw_tx_frame(ch9431, buf, frame->can_dlc, tx_buf_idx);
-#endif
+	buf[TXBD_LOAD_CMD] = INSTRUCTION_LOAD_TXBD(tx_buf_idx);
 
+	memcpy(buf + TXBDAT_OFF, frame->data, frame->can_dlc);
+	ch9431_hw_tx_frame(ch9431, buf, tx_buf_idx);
+	ch9431_write_mem(ch9431, tx_buf_idx, buf + TXBD_LOAD_CMD,
+			 frame->can_dlc + CH9431_TXBD_CMD_LEN);
+#endif
 	/* use INSTRUCTION_RTS, to avoid "repeated frame problem" */
 	ch9431->spi_tx_buf[0] = INSTRUCTION_RTS(1 << tx_buf_idx);
-	ch9431_spi_write(ch9431, 1);
+	ch9431_spi_write(ch9431, ch9431->spi_tx_buf, 1);
 }
 
 static void ch9431_hw_rx_frame(struct ch9431_priv *ch9431, u8 *buf,
 			       int rx_buf_idx)
 {
-	int i;
-
-	for (i = 1; i < RXBDAT_OFF; i++)
-		buf[i] = ch9431_read_reg(ch9431, RXBCTRL(rx_buf_idx) + i);
+	ch9431_spi_trans(ch9431, buf, INSTRUCTION_READ_RXBS(rx_buf_idx),
+			 CAN_FRAME_HEADER_LEN);
 }
 
 static void ch9431_hw_rx(struct ch9431_priv *ch9431, int rx_buf_idx)
 {
 	struct net_device *ndev = ch9431->ndev;
-	struct sk_buff	  *skb;
-	struct can_frame  *frame;
-	u8		   buf[SPI_TRANSFER_BUF_LEN];
+	struct sk_buff *skb;
+	struct can_frame *frame;
+	u8 buf[CAN_FRAME_HEADER_LEN];
 
 	skb = alloc_can_skb(ndev, &frame);
 	if (!skb) {
@@ -626,35 +719,36 @@ static void ch9431_hw_rx(struct ch9431_priv *ch9431, int rx_buf_idx)
 		frame->can_id = CAN_EFF_FLAG;
 		frame->can_id |=
 			/* Extended ID part */
-			(buf[RXBEIDH_OFF] << 10) | (buf[RXBEIDL_OFF] << 2) |
+			(buf[RXBEIDH_OFF] << 10) |
+			(buf[RXBEIDL_OFF] << 2) |
 			((buf[RXBSIDH_OFF] >> 6) & 0x03) |
 			/* Standard ID part */
-			((((buf[RXBSIDH_OFF] & 0x07) << 8) | buf[RXBSIDL_OFF])
+			((((buf[RXBSIDH_OFF] & 0x07) << 8) |
+			  buf[RXBSIDL_OFF])
 			 << 18);
 		/* Remote transmission request */
 		if (buf[RXBDLC_OFF] & RXBDLC_RTR)
 			frame->can_id |= CAN_RTR_FLAG;
 	} else {
 		/* Standard ID format */
-		frame->can_id =
-			((((buf[RXBSIDH_OFF] & 0x07) << 8) | buf[RXBSIDL_OFF]));
+		frame->can_id = ((((buf[RXBSIDH_OFF] & 0x07) << 8) |
+				  buf[RXBSIDL_OFF]));
 	}
 
 	/* Data length */
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0))
 	frame->len = can_cc_dlc2len(buf[RXBDLC_OFF] & RXBDLC_LEN_MASK);
 	if (!(frame->can_id & CAN_RTR_FLAG)) {
-		ch9431_read_mem(ch9431, RXBDAT(rx_buf_idx), buf, frame->len);
-		memcpy(frame->data, buf + RXBDAT_OFF, frame->len);
+		ch9431_read_mem(ch9431, rx_buf_idx, frame->data,
+				frame->len);
 
 		ch9431->ndev->stats.rx_bytes += frame->len;
 	}
 #else
 	frame->can_dlc = get_can_dlc(buf[RXBDLC_OFF] & RXBDLC_LEN_MASK);
 	if (!(frame->can_id & CAN_RTR_FLAG)) {
-		ch9431_read_mem(ch9431, RXBDAT(rx_buf_idx), buf,
+		ch9431_read_mem(ch9431, rx_buf_idx, frame->data,
 				frame->can_dlc);
-		memcpy(frame->data, buf + RXBDAT_OFF, frame->can_dlc);
 
 		ch9431->ndev->stats.rx_bytes += frame->can_dlc;
 	}
@@ -678,15 +772,16 @@ static int ch9431_power_enable(struct regulator *reg, int enable)
 
 static void ch9431_hw_sleep(struct ch9431_priv *ch9431)
 {
-	ch9431_write_reg(ch9431, CH9431_CTRL, CH9431_CTRL_REQOP_SLEEP_LIGHT);
+	ch9431_write_reg(ch9431, CH9431_CTRL,
+			 CH9431_CTRL_REQOP_SLEEP_LIGHT);
 }
 
 /* May only be called when device is sleeping! */
 static int ch9431_hw_wake(struct ch9431_priv *ch9431)
 {
 	struct spi_device *spi = ch9431->spi;
-	u8		   value;
-	int		   ret;
+	u8 value;
+	int ret;
 
 	/* Force wakeup interrupt to wake device, but don't execute IST */
 	disable_irq(spi->irq);
@@ -703,7 +798,8 @@ static int ch9431_hw_wake(struct ch9431_priv *ch9431)
 	value = ch9431_read_reg(ch9431, CH9431_CTRL);
 
 	if (value != 0x20) {
-		dev_err(&spi->dev, "%s, ch9431 didn't enter in config mode\n",
+		dev_err(&spi->dev,
+			"%s, ch9431 didn't enter in config mode\n",
 			__func__);
 		return ret;
 	}
@@ -718,7 +814,7 @@ static int ch9431_hw_wake(struct ch9431_priv *ch9431)
 static int ch9431_set_normal_mode(struct ch9431_priv *ch9431)
 {
 	struct spi_device *spi = ch9431->spi;
-	int		   ret;
+	int ret;
 
 	/* Enable interrupts */
 	ch9431_write_reg(ch9431, CH9431_INTE,
@@ -732,13 +828,16 @@ static int ch9431_set_normal_mode(struct ch9431_priv *ch9431)
 				 CH9431_CTRL_REQOP_LOOPBACK);
 	} else if (ch9431->can.ctrlmode & CAN_CTRLMODE_LISTENONLY) {
 		/* Put device into listen-only mode */
-		ch9431_write_reg(ch9431, CH9431_CTRL, CH9431_CTRL_REQOP_LISTEN);
+		ch9431_write_reg(ch9431, CH9431_CTRL,
+				 CH9431_CTRL_REQOP_LISTEN);
 	} else {
 		/* Put device into normal mode */
-		ch9431_write_reg(ch9431, CH9431_CTRL, CH9431_CTRL_REQOP_NORMAL);
+		ch9431_write_reg(ch9431, CH9431_CTRL,
+				 CH9431_CTRL_REQOP_NORMAL);
 
 		/* Wait for the device to enter normal mode */
-		ret = ch9431_read_stat_poll_timeout(ch9431, 0, OST_DELAY_MS * 1000, 10000);
+		ret = ch9431_read_stat_poll_timeout(
+			ch9431, 0, OST_DELAY_MS * 1000, 10000);
 		if (ret) {
 			dev_err(&spi->dev,
 				"%s, ret = %d, ch9431 didn't enter in normal mode!\n",
@@ -754,20 +853,21 @@ static int ch9431_set_normal_mode(struct ch9431_priv *ch9431)
 /* Set CNF1/CNF2/CNF3 Set Baud Rate*/
 static int ch9431_do_set_bittiming(struct net_device *ndev)
 {
-	struct ch9431_priv   *ch9431 = netdev_priv(ndev);
+	struct ch9431_priv *ch9431 = netdev_priv(ndev);
 	struct can_bittiming *bt = &ch9431->can.bittiming;
-	u8		      cfg1, cfg2, cfg3;
+	u8 cfg1, cfg2, cfg3;
 
 	cfg1 = (bt->brp - 1);
-	cfg2 = (((bt->sjw - 1) << 4) | (bt->prop_seg + bt->phase_seg1 - 1));
+	cfg2 = (((bt->sjw - 1) << 4) |
+		(bt->prop_seg + bt->phase_seg1 - 1));
 	cfg3 = (bt->phase_seg2 - 1);
 
 	ch9431_write_reg(ch9431, BTIMER1, cfg1);
 	ch9431_write_reg(ch9431, BTIMER2, cfg2);
 	ch9431_write_reg(ch9431, BTIMER3, cfg3);
 
-	dev_dbg(&ch9431->spi->dev, "%s, CNF: 0x%02x 0x%02x 0x%02x\n", __func__,
-		ch9431_read_reg(ch9431, BTIMER1),
+	dev_dbg(&ch9431->spi->dev, "%s, CNF: 0x%02x 0x%02x 0x%02x\n",
+		__func__, ch9431_read_reg(ch9431, BTIMER1),
 		ch9431_read_reg(ch9431, BTIMER2),
 		ch9431_read_reg(ch9431, BTIMER3));
 
@@ -778,14 +878,14 @@ static int ch9431_set_rxfilter(struct ch9431_priv *ch9431, u8 reg, u8 sidl,
 			       u8 sidh, u8 eidl, u8 eidh)
 {
 	int ret, i;
-	u8  val[4] = { sidl, sidh, eidl, eidh };
+	u8 val[4] = { sidl, sidh, eidl, eidh };
 
 	for (i = 0; i < 4; i++) {
 		ret = ch9431_write_reg(ch9431, reg + i, val[i]);
 		if (ret) {
 			dev_err(&ch9431->spi->dev,
-				"%s, ch9431 write reg: [0x%02x] failed.\n", __func__,
-				reg + i);
+				"%s, ch9431 write reg: [0x%02x] failed.\n",
+				__func__, reg + i);
 			return ret;
 		}
 	}
@@ -793,7 +893,8 @@ static int ch9431_set_rxfilter(struct ch9431_priv *ch9431, u8 reg, u8 sidl,
 	return ret;
 }
 
-static int ch9431_set_rxmask(struct ch9431_priv *ch9431, int rxm_id, u8 val)
+static int ch9431_set_rxmask(struct ch9431_priv *ch9431, int rxm_id,
+			     u8 val)
 {
 	int ret, i;
 
@@ -801,8 +902,8 @@ static int ch9431_set_rxmask(struct ch9431_priv *ch9431, int rxm_id, u8 val)
 		ret = ch9431_write_reg(ch9431, RXMID(rxm_id) + i, val);
 		if (ret) {
 			dev_err(&ch9431->spi->dev,
-				"%s, ch9431 write reg: [0x%02x] failed.\n", __func__,
-				RXMID(rxm_id) + i);
+				"%s, ch9431 write reg: [0x%02x] failed.\n",
+				__func__, RXMID(rxm_id) + i);
 			return ret;
 		}
 	}
@@ -813,7 +914,7 @@ static int ch9431_set_rxmask(struct ch9431_priv *ch9431, int rxm_id, u8 val)
 static int ch9431_setup(struct ch9431_priv *ch9431)
 {
 	struct net_device *ndev = ch9431->ndev;
-	int	i;
+	int i;
 
 	ch9431_write_reg(ch9431, RXB0CTRL, RXBCTRL_BUKT);
 
@@ -823,10 +924,10 @@ static int ch9431_setup(struct ch9431_priv *ch9431)
 	for (i = 0; i < 5; i++) {
 		if (i < 3)
 			ch9431_set_rxfilter(ch9431, RXFAID(i), RXFASIDL,
-						  RXFASIDH, RXFAEIDL, RXFAEIDH);
+					    RXFASIDH, RXFAEIDL, RXFAEIDH);
 		else
 			ch9431_set_rxfilter(ch9431, RXFBID(i), RXFASIDL,
-						  RXFBSIDH, RXFAEIDL, RXFAEIDH);
+					    RXFBSIDH, RXFAEIDL, RXFAEIDH);
 	}
 
 	ch9431_do_set_bittiming(ndev);
@@ -839,7 +940,7 @@ static void ch9431_tx_delay(struct work_struct *work)
 	struct ch9431_priv *ch9431 =
 		container_of(work, struct ch9431_priv, tx_work);
 	struct net_device *ndev = ch9431->ndev;
-	struct can_frame  *frame;
+	struct can_frame *frame;
 
 	mutex_lock(&ch9431->ops_lock);
 
@@ -872,13 +973,13 @@ static void ch9431_tx_delay(struct work_struct *work)
 static int ch9431_hw_reset(struct ch9431_priv *ch9431)
 {
 	struct spi_device *spi = ch9431->spi;
-	int		   ret;
+	int ret;
 
 	/* Wait for oscillator startup timer after power up */
 	mdelay(RST_DELAY_MS);
 
 	ch9431->spi_tx_buf[0] = CMD_CAN_RESET;
-	ret = ch9431_spi_write(ch9431, 1);
+	ret = ch9431_spi_write(ch9431, ch9431->spi_tx_buf, 1);
 	if (ret) {
 		dev_err(&spi->dev, "CH9431 CAN reset cmd send fail.\n");
 		return ret;
@@ -888,7 +989,8 @@ static int ch9431_hw_reset(struct ch9431_priv *ch9431)
 	mdelay(RST_DELAY_MS);
 
 	/* Wait for reset to finish */
-	ret = ch9431_read_stat_poll_timeout(ch9431, CH9431_CTRL_REQOP_CONFIG,
+	ret = ch9431_read_stat_poll_timeout(ch9431,
+					    CH9431_CTRL_REQOP_CONFIG,
 					    OST_DELAY_MS * 1000, 10000);
 	if (ret)
 		dev_err(&spi->dev,
@@ -897,9 +999,10 @@ static int ch9431_hw_reset(struct ch9431_priv *ch9431)
 	return ret;
 }
 
-static void ch9431_error_skb(struct net_device *ndev, int can_id, int data1)
+static void ch9431_error_skb(struct net_device *ndev, int can_id,
+			     int data1)
 {
-	struct sk_buff	 *skb;
+	struct sk_buff *skb;
 	struct can_frame *frame;
 
 	skb = alloc_can_err_skb(ndev, &frame);
@@ -908,7 +1011,8 @@ static void ch9431_error_skb(struct net_device *ndev, int can_id, int data1)
 		frame->data[1] = data1;
 		netif_rx(skb);
 	} else {
-		netdev_err(ndev, "%s, cannot allocate error skb\n", __func__);
+		netdev_err(ndev, "%s, cannot allocate error skb\n",
+			   __func__);
 	}
 }
 
@@ -953,31 +1057,30 @@ static void ch9431_restart_tx(struct work_struct *work)
 static irqreturn_t ch9431_rx_threaded_irq(int irq, void *pw)
 {
 	struct ch9431_priv *ch9431 = pw;
-	struct net_device  *ndev = ch9431->ndev;
+	struct net_device *ndev = ch9431->ndev;
 
 	mutex_lock(&ch9431->ops_lock);
 
-	while (!ch9431->force_quit) {
+	if (!ch9431->force_quit) {
 		enum can_state new_state;
-		u8	       intf, errf;
-		u8	       clear_intf = 0;
-		int	       can_id = 0, data1 = 0;
+		u8 intf, errf;
+		u8 clear_intf = 0;
+		int can_id = 0, data1 = 0;
 
 		ch9431_read_2regs(ch9431, CH9431_INTF, &intf, &errf);
 
 		/* Receive buffer 0 */
 		if (intf & CH9431_INTF_RX0IF) {
 			ch9431_hw_rx(ch9431, 0);
-			ch9431_write_bits(ch9431, CH9431_INTF,
-					  CH9431_INTF_RX0IF, 0x00);
+			ch9431_clear_intr(ch9431, CH9431_INTF_RX0IF);
 
 			/* Check if buffer 1 is already known to be full, no need to re-read */
 			if (!(intf & CH9431_INTF_RX1IF)) {
 				u8 intf1, errf1;
 
 				/* Intf reg needs to be read again to avoid a race condition */
-				ch9431_read_2regs(ch9431, CH9431_INTF, &intf1,
-						  &errf1);
+				ch9431_read_2regs(ch9431, CH9431_INTF,
+						  &intf1, &errf1);
 
 				/* Combine flags from both operations for error handling */
 				intf |= intf1;
@@ -988,8 +1091,7 @@ static irqreturn_t ch9431_rx_threaded_irq(int irq, void *pw)
 		/* Receive buffer 1 */
 		if (intf & CH9431_INTF_RX1IF) {
 			ch9431_hw_rx(ch9431, 1);
-			ch9431_write_bits(ch9431, CH9431_INTF,
-					  CH9431_INTF_RX1IF, 0x00);
+			ch9431_clear_intr(ch9431, CH9431_INTF_RX1IF);
 		}
 
 		/* Mask out flags we don't care about */
@@ -997,13 +1099,14 @@ static irqreturn_t ch9431_rx_threaded_irq(int irq, void *pw)
 
 		/* Any error or tx interrupt we need to clear? */
 		if (intf & (CH9431_INTF_ERR | CH9431_INTF_TX))
-			clear_intf |= intf & (CH9431_INTF_ERR | CH9431_INTF_TX);
+			clear_intf |= intf &
+				      (CH9431_INTF_ERR | CH9431_INTF_TX);
 		if (clear_intf)
-			ch9431_write_bits(ch9431, CH9431_INTF, clear_intf,
-					  0x00);
+			ch9431_clear_intr(ch9431, clear_intf);
 
 		if (errf & (CH9431_EFLAG_RX0OVR | CH9431_EFLAG_RX1OVR))
-			ch9431_write_bits(ch9431, CH9431_EFLAG, errf, 0x00);
+			ch9431_write_bits(ch9431, CH9431_EFLAG, errf,
+					  0x00);
 
 		/* Update can state */
 		if (errf & CH9431_EFLAG_TXBO) {
@@ -1072,12 +1175,12 @@ static irqreturn_t ch9431_rx_threaded_irq(int irq, void *pw)
 				ch9431->can.can_stats.bus_off++;
 				can_bus_off(ndev);
 				ch9431_hw_sleep(ch9431);
-				break;
+				goto out;
 			}
 		}
 
 		if (intf == 0)
-			break;
+			goto out;
 
 		if (intf & CH9431_INTF_TX) {
 			if (ch9431->tx_busy) {
@@ -1095,6 +1198,7 @@ static irqreturn_t ch9431_rx_threaded_irq(int irq, void *pw)
 		}
 	}
 
+out:
 	mutex_unlock(&ch9431->ops_lock);
 
 	return IRQ_HANDLED;
@@ -1108,8 +1212,8 @@ static irqreturn_t ch9431_rx_threaded_irq(int irq, void *pw)
 static int ch9431_open(struct net_device *ndev)
 {
 	struct ch9431_priv *ch9431 = netdev_priv(ndev);
-	struct spi_device  *spi = ch9431->spi;
-	int		    ret;
+	struct spi_device *spi = ch9431->spi;
+	int ret;
 
 	ret = open_candev(ndev);
 	if (ret) {
@@ -1147,15 +1251,17 @@ out_close:
 	ch9431_hw_sleep(ch9431);
 	ch9431_power_enable(ch9431->transceiver, 0);
 	close_candev(ndev);
+	netdev_err(ndev, "%s : ch9431 open failed, ret: %d\n", __func__,
+		   ret);
 	mutex_unlock(&ch9431->ops_lock);
-	return 0;
+	return ret;
 }
 
 static int ch9431_hw_probe(struct ch9431_priv *ch9431)
 {
 	struct spi_device *spi = ch9431->spi;
-	u8		   ctrl;
-	int		   ret;
+	u8 ctrl;
+	int ret;
 
 	ret = ch9431_hw_reset(ch9431);
 	if (ret)
@@ -1207,13 +1313,14 @@ static int ch9431_stop(struct net_device *ndev)
 /*
  * event: play a schedule starter in condition
  */
-static netdev_tx_t ch9431_start_xmit(struct sk_buff    *skb,
+static netdev_tx_t ch9431_start_xmit(struct sk_buff *skb,
 				     struct net_device *ndev)
 {
 	struct ch9431_priv *ch9431 = netdev_priv(ndev);
 
 	if (ch9431->tx_skb || ch9431->tx_busy) {
-		dev_warn(&ch9431->spi->dev, "hard_xmit called while tx busy\n");
+		dev_warn(&ch9431->spi->dev,
+			 "hard_xmit called while tx busy\n");
 		return NETDEV_TX_BUSY;
 	}
 
@@ -1257,13 +1364,13 @@ static const struct net_device_ops ch9431_netdev_ops = {
 #endif
 };
 
-static ssize_t reg_dump_show(struct device *dev, struct device_attribute *attr,
-			     char *buf)
+static ssize_t reg_dump_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
 {
-	struct spi_device  *spi = container_of(dev, struct spi_device, dev);
+	struct spi_device *spi = container_of(dev, struct spi_device, dev);
 	struct ch9431_priv *ch9431 = NULL;
-	int		    i, len = 0;
-	u8		    val;
+	int i, len = 0;
+	u8 val;
 
 	dev_info(dev, "reg_dump_show");
 	if (!spi) {
@@ -1280,21 +1387,22 @@ static ssize_t reg_dump_show(struct device *dev, struct device_attribute *attr,
 
 	for (i = 0; i < sizeof(reg_labels) / sizeof(reg_labels[0]); i++) {
 		val = ch9431_read_reg(ch9431, reg_labels[i].reg);
-		len += sprintf(buf + len, "%s: 0x%02x\n", reg_labels[i].name,
-			       val);
+		len += sprintf(buf + len, "%s: 0x%02x\n",
+			       reg_labels[i].name, val);
 	}
 
 	return len;
 }
 
-static ssize_t reg_dump_store(struct device *dev, struct device_attribute *attr,
+static ssize_t reg_dump_store(struct device *dev,
+			      struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct spi_device  *spi = container_of(dev, struct spi_device, dev);
+	struct spi_device *spi = container_of(dev, struct spi_device, dev);
 	struct ch9431_priv *ch9431;
-	u8		    reg;
-	u8		    val;
-	char		    reg_name[32];
+	u8 reg;
+	u8 val;
+	char reg_name[32];
 
 	dev_info(dev, "reg_dump_store\n");
 	if (!spi) {
@@ -1329,7 +1437,8 @@ static ssize_t reg_dump_store(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
-static DEVICE_ATTR(reg_dump, S_IRUGO | S_IWUSR, reg_dump_show, reg_dump_store);
+static DEVICE_ATTR(reg_dump, S_IRUGO | S_IWUSR, reg_dump_show,
+		   reg_dump_store);
 
 static struct attribute *ch9431_attributes[] = { &dev_attr_reg_dump.attr,
 						 NULL };
@@ -1345,7 +1454,8 @@ int ch9431_create_sysfs(struct spi_device *spi)
 	err = sysfs_create_group(&spi->dev.kobj, &ch9431_attribute_group);
 	if (err != 0) {
 		dev_err(&spi->dev, "sysfs_create_group() failed!");
-		sysfs_remove_group(&spi->dev.kobj, &ch9431_attribute_group);
+		sysfs_remove_group(&spi->dev.kobj,
+				   &ch9431_attribute_group);
 		return -EIO;
 	}
 
@@ -1364,8 +1474,8 @@ static int ch9431_request_irq(struct ch9431_priv *ch9431)
 {
 	struct net_device *ndev = ch9431->ndev;
 	struct spi_device *spi = ch9431->spi;
-	int		   ret;
-	unsigned long	   flags = IRQF_TRIGGER_LOW;
+	int ret;
+	unsigned long flags = IRQF_TRIGGER_LOW;
 
 	/* if your platform supports acquire irq number from dts */
 #ifdef USE_IRQ_FROM_DTS
@@ -1388,25 +1498,23 @@ static int ch9431_request_irq(struct ch9431_priv *ch9431)
 	ndev->irq = spi->irq;
 #endif
 	ret = request_threaded_irq(spi->irq, NULL, ch9431_rx_threaded_irq,
-				   flags | IRQF_ONESHOT, dev_name(&spi->dev),
-				   ch9431);
+				   flags | IRQF_ONESHOT,
+				   dev_name(&spi->dev), ch9431);
 	if (ret) {
 		dev_err(&spi->dev, "failed to acquire irq %d\n", spi->irq);
 		goto out;
 	}
 
-	netif_wake_queue(ndev);
-
 out:
-	return 0;
+	return ret;
 }
 
 static int ch9431_probe(struct spi_device *spi)
 {
-	struct device	   *dev = &spi->dev;
-	struct net_device  *ndev;
+	struct device *dev = &spi->dev;
+	struct net_device *ndev;
 	struct ch9431_priv *ch9431;
-	int		    ret = 0;
+	int ret = 0;
 
 	/* Allocate can/net device */
 	ndev = alloc_candev(sizeof(struct ch9431_priv), TX_ECHO_SKB_MAX);
@@ -1454,8 +1562,8 @@ static int ch9431_probe(struct spi_device *spi)
 	if (ret)
 		goto out_free;
 
-	ch9431->wq =
-		alloc_workqueue("ch9431_wq", WQ_FREEZABLE | WQ_MEM_RECLAIM, 0);
+	ch9431->wq = alloc_workqueue("ch9431_wq",
+				     WQ_FREEZABLE | WQ_MEM_RECLAIM, 0);
 	if (!ch9431->wq) {
 		ret = -ENOMEM;
 		goto out_free;
@@ -1522,7 +1630,7 @@ out_free:
 static void ch9431_drv_remove(struct spi_device *spi)
 {
 	struct ch9431_priv *ch9431 = spi_get_drvdata(spi);
-	struct net_device  *net = ch9431->ndev;
+	struct net_device *net = ch9431->ndev;
 
 	unregister_candev(net);
 
